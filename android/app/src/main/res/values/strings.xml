@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">NeuralSync Player</string>
+    <string name="title_activity_main">NeuralSync Player</string>
+    <string name="package_name">com.musicplayer.app</string>
+    <string name="custom_url_scheme">com.musicplayer.app</string>
+</resources>
