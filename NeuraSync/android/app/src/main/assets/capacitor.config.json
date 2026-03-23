@@ -1,0 +1,8 @@
+{
+	"appId": "com.musicplayer.app",
+	"appName": "NeuralSync Player",
+	"webDir": "dist",
+	"server": {
+		"androidScheme": "https"
+	}
+}
