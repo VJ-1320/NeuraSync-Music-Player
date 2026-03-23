@@ -26,10 +26,9 @@ function hexToRgba(hex: string, a: number) {
 
 function fmt(sec: number) {
   if (!sec || isNaN(sec) || !isFinite(sec)) return "0:00";
-  const totalSeconds = Math.max(0, Math.floor(sec));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = Math.floor(totalSeconds % 60);
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  const minutes = Math.floor(sec / 60);
+  const seconds = Math.floor(sec % 60);
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function makePart(i: number, n: number) {
@@ -282,7 +281,7 @@ export default function App() {
     const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
     const ctx = new AudioContext();
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
+    analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.6;
     
     // Create EQ Filters
@@ -571,28 +570,28 @@ export default function App() {
         // Auto-EQ Monitoring Loop
         if (autoEq) {
           const data = dataArrayRef.current;
-          // Monitor lowSum (0-100Hz) - bins 0 to 2 approx for 512 FFT
+          // Monitor lowSum (0-100Hz) - bins 0 to 4 approx for 1024 FFT
           let lowSum = 0; 
-          for (let i = 0; i < 2; i++) lowSum += data[i];
-          const lowAvg = lowSum / 2;
+          for (let i = 0; i < 4; i++) lowSum += data[i];
+          const lowAvg = lowSum / 4;
           
           // Median spectrum for comparison
           let totalSum = 0;
-          for (let i = 0; i < 256; i++) totalSum += data[i];
-          const median = totalSum / 256;
+          for (let i = 0; i < 512; i++) totalSum += data[i];
+          const median = totalSum / 512;
           
           const threshold = 22; // ~6dB
           if (lowAvg > median + threshold) {
             const diff = lowAvg - (median + threshold);
-            const attenuation = Math.min(12, diff * 0.5);
-            autoEqBassRef.current += (attenuation - autoEqBassRef.current) * 0.1;
+            const attenuation = Math.min(15, diff * 0.6);
+            autoEqBassRef.current += (attenuation - autoEqBassRef.current) * 0.15;
           } else {
-            autoEqBassRef.current *= 0.95;
+            autoEqBassRef.current *= 0.92;
           }
           
           if (filterNodesRef.current[0]) {
             const targetGain = eqGains[0] - autoEqBassRef.current;
-            filterNodesRef.current[0].gain.setTargetAtTime(targetGain, audioCtxRef.current?.currentTime || 0, 0.1);
+            filterNodesRef.current[0].gain.setTargetAtTime(targetGain, audioCtxRef.current?.currentTime || 0, 0.05);
           }
         }
 
@@ -850,30 +849,23 @@ export default function App() {
       const W = cv.width, H = cv.height;
       if (W === 0 || H === 0) return;
       
-      const t = ts * 0.001;
+      const data = dataArrayRef.current;
+      if (!data) return;
+
       const E = energyRef.current;
       ctx.clearRect(0, 0, W, H);
       
       const bw = W / N;
       for (let i = 0; i < N; i++) {
-        const n = i / N;
-        const sp =
-          Math.exp(-(((n - 0.08) * 5) ** 2)) * 0.95 +
-          Math.exp(-(((n - 0.30) * 6) ** 2)) * 0.60 +
-          Math.exp(-(((n - 0.60) * 7) ** 2)) * 0.35 +
-          Math.exp(-(((n - 0.85) * 9) ** 2)) * 0.18;
-        const nz =
-          Math.sin(i * 2.1 + t * 2.9) * 0.4 +
-          Math.sin(i * 0.9 + t * 1.2) * 0.12;
+        // Map first 128 bins
+        const val = data[i] / 255;
+        const h = Math.max(2, val * H * 0.9);
+        const x = i * bw;
+        const y = H - h;
         
-        const h  = Math.max(2, (sp * 0.75 + Math.max(0, nz) * 0.35 + 0.07) * E * H * 1.2);
-        const x  = i * bw;
-        const y  = H - h;
-        
-        const al = 0.3 + E * 0.6;
-        const g  = ctx.createLinearGradient(x, y, x, H);
-        g.addColorStop(0,   moodColor);
-        g.addColorStop(1,   hexToRgba(moodColor, 0));
+        const g = ctx.createLinearGradient(x, y, x, H);
+        g.addColorStop(0, moodColor);
+        g.addColorStop(1, hexToRgba(moodColor, 0));
         
         ctx.save();
         if (E > 0.6) {
@@ -1117,7 +1109,7 @@ export default function App() {
 
   return (
     <div 
-      className="min-h-screen bg-black text-white selection:bg-emerald-500/30 font-mono overflow-hidden"
+      className="h-[100dvh] bg-black text-white selection:bg-emerald-500/30 font-mono overflow-hidden"
     >
       {/* Grid Overlay */}
       <div className="absolute inset-0 pointer-events-none opacity-[0.03]" style={{ backgroundImage: `linear-gradient(${moodColor} 1px, transparent 1px), linear-gradient(90deg, ${moodColor} 1px, transparent 1px)`, backgroundSize: '40px 40px' }} />
@@ -1218,8 +1210,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* Left: Visualizer Disc - 45% height approx */}
-          <div className="flex flex-col items-center justify-center flex-shrink-0 mt-8 md:mt-0 h-[45%]">
+          {/* Left: Visualizer Disc - 40% height approx */}
+          <div className="flex flex-col items-center justify-center flex-shrink-0 mt-8 md:mt-0 h-[40%]">
             <div 
               onTouchStart={startTouchDrag}
               onTouchMove={onTouchMove}
@@ -1250,8 +1242,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* Right: Controls & Data - 47% height approx */}
-          <div className="flex flex-col items-center text-center md:items-start md:text-left justify-center w-full md:w-80 min-h-0 md:overflow-hidden pb-8 md:pb-0 h-[47%]">
+          {/* Right: Controls & Data - 60% height approx */}
+          <div className="flex flex-col items-center text-center md:items-start md:text-left justify-center w-full md:w-80 min-h-0 md:overflow-hidden pb-8 md:pb-0 h-[60%]">
             
             {/* Static Metadata Block */}
             <div className="h-[120px] w-full flex flex-col items-center justify-center bg-white/[0.03] border border-white/10 rounded-2xl mb-3 md:mb-4 flex-shrink-0 overflow-hidden relative group">
@@ -1276,7 +1268,10 @@ export default function App() {
                      <div className="w-1 h-1 rounded-full bg-emerald-500" />
                      <div className="h-[1px] w-4 bg-emerald-500/50" />
                    </div>
-                   <p className="text-emerald-400 text-[10px] font-bold tracking-[0.3em] uppercase opacity-90 truncate">
+                   <p 
+                     className="text-emerald-400 text-[10px] font-bold tracking-[0.3em] uppercase truncate"
+                     style={{ opacity: 0.6 + energyRef.current * 0.4 }}
+                   >
                      {audioError || (micMode ? "LIVE_INPUT" : (captureMode ? "SYSTEM_CAPTURE" : track.sub))}
                    </p>
                  </motion.div>
