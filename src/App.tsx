@@ -7,7 +7,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { 
   Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, 
   Mic, Monitor, Music as MusicIcon, Maximize2, Settings, HelpCircle,
-  Timer, Zap, Activity, Layers
+  Timer, Zap, Activity, Layers, Search, Trash2, X
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { Capacitor, registerPlugin } from "@capacitor/core";
@@ -82,6 +82,8 @@ export default function App() {
   const sourceRef     = useRef<MediaElementAudioSourceNode | null>(null);
   const micSourceRef   = useRef<MediaStreamAudioSourceNode | null>(null);
   const outputGainRef  = useRef<GainNode | null>(null);
+  const sleepFilterRef = useRef<BiquadFilterNode | null>(null);
+  const wakeLockRef    = useRef<any>(null);
   const filterNodesRef = useRef<BiquadFilterNode[]>([]);
   const dataArrayRef  = useRef<Uint8Array | null>(null);
   
@@ -100,6 +102,10 @@ export default function App() {
   const [showSess,    setShowSess]    = useState(false);
   const [bpm,         setBpm]         = useState<number | null>(null);
   const [autoBpm,     setAutoBpm]     = useState(0);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [showBatteryPrompt, setShowBatteryPrompt] = useState(false);
+  const [notification, setNotification] = useState<string | null>(null);
   
   const bassRef       = useRef(0);
   const bumpRef       = useRef(0);
@@ -166,11 +172,6 @@ export default function App() {
       return;
     }
 
-    // Cleanup previous blob URLs
-    tracks.forEach(t => {
-      if (t.src.startsWith('blob:')) URL.revokeObjectURL(t.src);
-    });
-
     const newTracks: Track[] = audioFiles.map((file: File) => ({
       title: file.name.replace(/\.[^/.]+$/, "").toUpperCase(),
       sub: "LOCAL_FILE // " + (file.type.split('/')[1] || "AUDIO").toUpperCase(),
@@ -179,11 +180,13 @@ export default function App() {
       src: URL.createObjectURL(file)
     }));
 
-    setTracks(newTracks);
-    setTidx(0);
-    setPlaying(true);
+    setTracks(prev => {
+      const updated = [...prev, ...newTracks];
+      localStorage.setItem('NEURASYNC_REGISTRY', JSON.stringify(updated));
+      return updated;
+    });
     setAudioError(null);
-  }, [tracks]);
+  }, []);
 
   const onLoadFolderClick = useCallback(async () => {
     if (audioCtxRef.current?.state === 'suspended') {
@@ -198,11 +201,6 @@ export default function App() {
         
         if (result.files.length === 0) return;
 
-        // Cleanup previous blob URLs
-        tracks.forEach(t => {
-          if (t.src.startsWith('blob:')) URL.revokeObjectURL(t.src);
-        });
-
         const newTracks: Track[] = result.files.map(file => ({
           title: file.name.replace(/\.[^/.]+$/, "").toUpperCase(),
           sub: "LOCAL_FILE // MOBILE",
@@ -211,9 +209,11 @@ export default function App() {
           src: Capacitor.convertFileSrc(file.path || '')
         }));
 
-        setTracks(newTracks);
-        setTidx(0);
-        setPlaying(true);
+        setTracks(prev => {
+          const updated = [...prev, ...newTracks];
+          localStorage.setItem('NEURASYNC_REGISTRY', JSON.stringify(updated));
+          return updated;
+        });
         setAudioError(null);
       } catch (err) {
         console.error("Mobile file pick failed:", err);
@@ -222,7 +222,39 @@ export default function App() {
     } else {
       fileInputRef.current?.click();
     }
-  }, [tracks]);
+  }, []);
+
+  const deleteTrack = useCallback((index: number) => {
+    setTracks(prev => {
+      const updated = prev.filter((_, i) => i !== index);
+      localStorage.setItem('NEURASYNC_REGISTRY', JSON.stringify(updated));
+      return updated;
+    });
+    setNotification("REGISTRY UPDATED");
+    if (tidx >= index && tidx > 0) {
+      setTidx(prev => prev - 1);
+    }
+  }, [tidx]);
+
+  // Persistence: Load on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('NEURASYNC_REGISTRY');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) setTracks(parsed);
+      } catch (e) {
+        console.error("Failed to parse registry", e);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
 
   // Memory Management: Cleanup ObjectURLs on unmount
   useEffect(() => {
@@ -265,6 +297,15 @@ export default function App() {
   useEffect(() => {
     if (Capacitor.isNativePlatform()) {
       GlyphPlugin.initGlyph().catch((e: any) => console.error("Glyph init failed", e));
+      
+      // Battery Optimization Check
+      const checkBattery = async () => {
+        const hasPrompted = localStorage.getItem('NEURASYNC_BATTERY_PROMPT');
+        if (!hasPrompted) {
+          setShowBatteryPrompt(true);
+        }
+      };
+      checkBattery();
     }
     return () => {
       if (Capacitor.isNativePlatform()) {
@@ -300,11 +341,18 @@ export default function App() {
     outputGain.connect(ctx.destination);
     outputGainRef.current = outputGain;
 
+    // Sleep Filter (Low-pass)
+    const sleepFilter = ctx.createBiquadFilter();
+    sleepFilter.type = "lowpass";
+    sleepFilter.frequency.value = 20000;
+    sleepFilterRef.current = sleepFilter;
+
     // Connect Filter Chain
     for (let i = 0; i < filters.length - 1; i++) {
       filters[i].connect(filters[i + 1]);
     }
-    filters[filters.length - 1].connect(analyser);
+    filters[filters.length - 1].connect(sleepFilter);
+    sleepFilter.connect(analyser);
     analyser.connect(outputGain);
     
     audioCtxRef.current = ctx;
@@ -604,6 +652,13 @@ export default function App() {
         const targetE = avg / 64; 
         energyRef.current += (targetE - energyRef.current) * 0.2;
 
+        // Trigger Glyph Intensity Pulse (Throttled to 150ms)
+        const now = performance.now();
+        if (Capacitor.isNativePlatform() && now - lastPulseRef.current > 150) {
+          (GlyphPlugin as any).triggerIntensityPulse({ brightness: Math.round(avg) }).catch(() => {});
+          lastPulseRef.current = now;
+        }
+
         // Bass Bump calculation (20Hz - 100Hz approx bins 0-4 for 256 FFT)
         let bassSum = 0;
         for (let i = 0; i < 4; i++) {
@@ -619,12 +674,11 @@ export default function App() {
         B = bumpRef.current;
       }
 
-      // Apply Transform to Card (Shake and Scale only)
+      // Apply Transform to Card (Stabilized Pulse)
       if (cardRef.current) {
-        const shakeX = (Math.random() - 0.5) * B * 15;
-        const shakeY = (Math.random() - 0.5) * B * 15;
-        const scale = 1 + B * 0.04;
-        cardRef.current.style.transform = `scale(${scale}) translate3d(${shakeX}px, ${shakeY}px, 0)`;
+        // Strictly scale based on bass energy to prevent vibration
+        const scale = 1 + B * 0.03;
+        cardRef.current.style.transform = `scale(${scale})`;
       }
 
       if (analyserRef.current && dataArrayRef.current) {
@@ -633,12 +687,6 @@ export default function App() {
         if (E > 0.85 || B > 0.8) { // Threshold for a beat or heavy bass
           const now = performance.now();
           
-          // Trigger Glyph Pulse (Throttled to 150ms)
-          if (Capacitor.isNativePlatform() && now - lastPulseRef.current > 150) {
-            GlyphPlugin.triggerPulse().catch(() => {});
-            lastPulseRef.current = now;
-          }
-
           const delta = now - lastPeakTimeRef.current;
           if (delta > 300 && delta < 1500) { // Limit to reasonable BPM range (40-200)
             burstRef.current = 1.0; // Trigger explosive burst
@@ -667,12 +715,70 @@ export default function App() {
     const id = setInterval(() => {
       setSessElapsed(e => {
         const ne = e + 0.1;
-        if (ne >= sessionMins * 60) { setPlaying(false); return 0; }
+        const totalSec = sessionMins * 60;
+        const remaining = totalSec - ne;
+
+        // Sleep Fade Logic (final 60s)
+        if (remaining <= 60 && remaining > 0) {
+          const progress = 1 - (remaining / 60); // 0 to 1
+          if (outputGainRef.current && audioCtxRef.current) {
+            const now = audioCtxRef.current.currentTime;
+            // Ramp down volume
+            outputGainRef.current.gain.setTargetAtTime(volume * (1 - progress), now, 0.1);
+          }
+          if (sleepFilterRef.current && audioCtxRef.current) {
+            const now = audioCtxRef.current.currentTime;
+            // Sweep low-pass filter from 20kHz to 400Hz
+            const freq = 20000 * Math.pow(400 / 20000, progress);
+            sleepFilterRef.current.frequency.setTargetAtTime(freq, now, 0.1);
+          }
+        }
+
+        if (ne >= totalSec) { 
+          setPlaying(false); 
+          // Reset gains/filters for next session
+          if (outputGainRef.current && audioCtxRef.current) {
+            outputGainRef.current.gain.setTargetAtTime(volume, audioCtxRef.current.currentTime, 0.1);
+          }
+          if (sleepFilterRef.current && audioCtxRef.current) {
+            sleepFilterRef.current.frequency.setTargetAtTime(20000, audioCtxRef.current.currentTime, 0.1);
+          }
+          return 0; 
+        }
         return ne;
       });
     }, 100);
     return () => clearInterval(id);
-  }, [playing, sessionMins]);
+  }, [playing, sessionMins, volume]);
+
+  // Wake Lock & Foreground Service
+  useEffect(() => {
+    if (playing && Capacitor.isNativePlatform()) {
+      const requestWakeLock = async () => {
+        try {
+          if ('wakeLock' in navigator) {
+            wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+          }
+          // Request foreground service and wake lock via GlyphPlugin (assumed native bridge)
+          await (GlyphPlugin as any).startForegroundService({
+            title: "NEURAL_SYNC ACTIVE",
+            text: "OPTIMIZING_BACKGROUND_RELIABILITY..."
+          });
+        } catch (err) {
+          console.error("WakeLock/ForegroundService failed:", err);
+        }
+      };
+      requestWakeLock();
+    } else {
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release();
+        wakeLockRef.current = null;
+      }
+      if (Capacitor.isNativePlatform()) {
+        (GlyphPlugin as any).stopForegroundService().catch(() => {});
+      }
+    }
+  }, [playing]);
 
   const togglePlay = useCallback(() => {
     if (audioCtxRef.current?.state === 'suspended') {
@@ -743,15 +849,22 @@ export default function App() {
       if (!playing) return;
       raf = requestAnimationFrame(draw);
       const t  = ts * 0.001;
-      const tE = playRef.current ? (captureMode ? energyRef.current : track.E) : 0.04;
-      energyRef.current += (tE - energyRef.current) * 0.028;
       const E = energyRef.current;
+      const B = bumpRef.current;
       
       // Decay burst intensity
       burstRef.current *= 0.94;
       const burst = burstRef.current;
 
       ctx.clearRect(0, 0, W, H);
+
+      // Central Glow
+      const glowSize = 40 + B * 30;
+      const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowSize);
+      glowGrad.addColorStop(0, hexToRgba(moodColor, 0.15 + B * 0.2));
+      glowGrad.addColorStop(1, "transparent");
+      ctx.fillStyle = glowGrad;
+      ctx.fillRect(0, 0, W, H);
 
       parts.current.forEach(p => {
         // Explosive multipliers
@@ -772,12 +885,12 @@ export default function App() {
 
       for (let ring = 0; ring < 6; ring++) {
         const baseR = 36 + ring * 16;
-        const steps = 120; // Reduced steps
+        const steps = 120; 
         ctx.beginPath();
         for (let i = 0; i <= steps; i++) {
           const a = (i / steps) * Math.PI * 2;
           const w =
-            Math.sin(a * (3 + ring) + t * (1.0 + ring * 0.28)) * E * 15 +
+            Math.sin(a * (3 + ring) + t * (1.0 + ring * 0.28)) * (E * 10 + B * 15) +
             Math.sin(a * 13 + t * 0.85) * E * 3.5;
           const rr = baseR + w;
           const x  = cx + Math.cos(a) * rr;
@@ -785,8 +898,8 @@ export default function App() {
           i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
         }
         ctx.closePath();
-        ctx.strokeStyle = hexToRgba(moodColor, 0.055 + (6 - ring) * 0.022 + E * 0.1);
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = hexToRgba(moodColor, 0.055 + (6 - ring) * 0.022 + E * 0.1 + B * 0.05);
+        ctx.lineWidth = 1 + B * 1.5;
         ctx.stroke();
       }
 
@@ -841,6 +954,7 @@ export default function App() {
     if (cv.parentElement) ro.observe(cv.parentElement);
     
     const N = 128;
+    const barHeights = new Float32Array(N);
     let raf: number;
     
     const draw = (ts: number) => {
@@ -853,23 +967,32 @@ export default function App() {
       if (!data) return;
 
       const E = energyRef.current;
+      const B = bumpRef.current;
       ctx.clearRect(0, 0, W, H);
       
       const bw = W / N;
       for (let i = 0; i < N; i++) {
-        // Map first 128 bins
-        const val = data[i] / 255;
-        const h = Math.max(2, val * H * 0.9);
+        const targetH = (data[i] / 255) * H * 0.9;
+        // Smooth decay
+        if (targetH > barHeights[i]) {
+          barHeights[i] = targetH;
+        } else {
+          barHeights[i] -= (barHeights[i] - targetH) * 0.15;
+        }
+
+        const h = Math.max(2, barHeights[i]);
         const x = i * bw;
         const y = H - h;
         
         const g = ctx.createLinearGradient(x, y, x, H);
+        // Dynamic coloring based on frequency
+        const hueShift = (i / N) * 40;
         g.addColorStop(0, moodColor);
         g.addColorStop(1, hexToRgba(moodColor, 0));
         
         ctx.save();
-        if (E > 0.6) {
-          ctx.shadowBlur = 15 * E;
+        if (E > 0.6 || B > 0.5) {
+          ctx.shadowBlur = (10 * E) + (10 * B);
           ctx.shadowColor = moodColor;
         }
         ctx.fillStyle = g;
@@ -903,24 +1026,29 @@ export default function App() {
       raf = requestAnimationFrame(draw);
       const t = ts * 0.001;
       const E = energyRef.current;
-      if (ts - lastShift > 55) {
+      const data = dataArrayRef.current;
+
+      if (ts - lastShift > 45) {
         lastShift = ts;
         bctx.clearRect(0, 0, W, H);
         bctx.drawImage(cv, -2, 0);
         ctx.clearRect(0, 0, W, H);
         ctx.drawImage(buf, 0, 0);
-        for (let y = 0; y < H; y++) {
-          const n  = 1 - y / H;
-          const sp =
-            Math.exp(-(((n - 0.08) * 5) ** 2)) * 0.95 +
-            Math.exp(-(((n - 0.30) * 6) ** 2)) * 0.60 +
-            Math.exp(-(((n - 0.60) * 7) ** 2)) * 0.35;
-          const nz = Math.sin(n * 28 + t * 5.5) * 0.25;
-          const intensity = Math.max(0, Math.min(1, (sp * 0.85 + nz * 0.18) * E * 1.35));
-          if (intensity > 0.015) {
-            const hue = moodColor === "#00ffb3" ? 162 : moodColor === "#4499ff" ? 220 : moodColor === "#ff5533" ? 15 : 278;
-            ctx.fillStyle = `hsla(${hue}, 100%, ${12 + intensity * 58}%, ${intensity * 0.88})`;
-            ctx.fillRect(W - 3, y, 3, 1);
+
+        if (data) {
+          const step = data.length / H;
+          for (let y = 0; y < H; y++) {
+            const dataIdx = Math.floor(y * step);
+            const val = data[dataIdx] / 255;
+            
+            // Logarithmic-like scaling for better visual distribution
+            const intensity = Math.pow(val, 1.5) * E * 1.5;
+
+            if (intensity > 0.01) {
+              const hue = moodColor === "#00ffb3" ? 162 : moodColor === "#4499ff" ? 220 : moodColor === "#ff5533" ? 15 : 278;
+              ctx.fillStyle = `hsla(${hue}, 100%, ${10 + intensity * 60}%, ${Math.min(1, intensity * 1.2)})`;
+              ctx.fillRect(W - 3, y, 3, 1);
+            }
           }
         }
       }
@@ -1101,6 +1229,11 @@ export default function App() {
     }
   }, []);
 
+  const filteredTracks = tracks.filter(t => 
+    t.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    t.sub.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
   const elapsed    = progress * track.dur;
   const sessTotal  = sessionMins * 60;
   const sessRatio  = sessTotal > 0 ? sessElapsed / sessTotal : 0;
@@ -1111,6 +1244,64 @@ export default function App() {
     <div 
       className="h-[100dvh] bg-black text-white selection:bg-emerald-500/30 font-mono overflow-hidden"
     >
+      {/* Battery Optimization Prompt */}
+      <AnimatePresence>
+        {showBatteryPrompt && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[6000] flex items-center justify-center bg-black/90 p-6"
+          >
+            <div className="bg-black border border-white/10 p-8 rounded-2xl max-w-sm text-center">
+              <h3 className="text-[10px] tracking-[0.2em] text-white/30 mb-4 uppercase">System Optimization</h3>
+              <p className="text-xs text-white/60 mb-8 leading-relaxed tracking-widest uppercase">
+                Exclude NEURAL_SYNC from battery optimizations to ensure uninterrupted background playback and Glyph synchronization.
+              </p>
+              <div className="flex flex-col gap-3">
+                <motion.button 
+                  whileHover={{ scale: 1.05, backgroundColor: "rgba(255,255,255,0.1)" }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={async () => {
+                    try {
+                      await (GlyphPlugin as any).requestBatteryOptimization();
+                      localStorage.setItem('NEURASYNC_BATTERY_PROMPT', 'true');
+                      setShowBatteryPrompt(false);
+                    } catch (e) {
+                      console.error("Battery optimization request failed", e);
+                      setShowBatteryPrompt(false);
+                    }
+                  }}
+                  className="w-full py-4 bg-white text-black text-[10px] font-bold tracking-[0.2em] rounded-lg uppercase"
+                >
+                  Exclude Now
+                </motion.button>
+                <motion.button 
+                  whileHover={{ scale: 1.05, backgroundColor: "rgba(255,255,255,0.05)" }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={() => setShowBatteryPrompt(false)}
+                  className="w-full py-4 border border-white/10 text-[10px] text-white/40 tracking-[0.2em] rounded-lg uppercase"
+                >
+                  Later
+                </motion.button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Notification */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, x: "-50%" }}
+            animate={{ opacity: 1, y: 0, x: "-50%" }}
+            exit={{ opacity: 0, y: -20, x: "-50%" }}
+            className="fixed top-8 left-1/2 z-[5000] bg-emerald-500 text-black px-6 py-2 rounded-full text-[10px] font-bold tracking-[0.2em] shadow-xl"
+          >
+            {notification}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Grid Overlay */}
       <div className="absolute inset-0 pointer-events-none opacity-[0.03]" style={{ backgroundImage: `linear-gradient(${moodColor} 1px, transparent 1px), linear-gradient(90deg, ${moodColor} 1px, transparent 1px)`, backgroundSize: '40px 40px' }} />
 
@@ -1119,10 +1310,10 @@ export default function App() {
         {ambient && (
           <motion.div 
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[2000] bg-black"
+            className="fixed inset-0 z-[2000] bg-black ambient-lock"
           >
             <canvas ref={ambRef} className="absolute inset-0 w-full h-full" />
-            <div className="absolute bottom-12 left-1/2 -translate-x-1/2 flex items-center gap-6 bg-black/60 border border-white/10 rounded-full px-8 py-4 backdrop-blur-xl">
+            <div className="absolute bottom-24 left-1/2 -translate-x-1/2 flex items-center gap-6 bg-black/60 border border-white/10 rounded-full px-10 py-5 backdrop-blur-xl">
               <div className="flex gap-2 mr-4 border-r border-white/10 pr-4">
                 {(["RINGS", "NEBULA", "GRID", "HORIZON", "BREATHE"] as const).map(style => (
                   <motion.button 
@@ -1149,9 +1340,10 @@ export default function App() {
                 whileHover={{ scale: 1.05, x: 5 }}
                 whileTap={{ scale: 0.95 }}
                 onClick={() => setAmbient(false)} 
-                className="text-[9px] tracking-[0.1em] text-white/20 hover:text-white/40"
+                className="flex items-center gap-2 text-[10px] font-bold tracking-[0.2em] text-white hover:text-emerald-400 transition-colors bg-white/5 px-4 py-2 rounded-full border border-white/10"
               >
-                EXIT [A]
+                <Volume2 size={14} />
+                <span>CLOSE AMBIENT</span>
               </motion.button>
             </div>
           </motion.div>
@@ -1169,7 +1361,7 @@ export default function App() {
             borderColor: hexToRgba(moodColor, 0.15),
             boxShadow: `0 0 100px ${hexToRgba(moodColor, 0.05)}, 0 40px 100px rgba(0,0,0,0.8)`
           }}
-          className="relative bg-[#050505]/95 border rounded-3xl p-4 md:p-12 flex flex-col md:flex-row items-center md:justify-center gap-4 md:gap-12 transition-all duration-300 w-full h-full max-w-4xl max-h-[96dvh] overflow-hidden"
+          className="relative bg-black border rounded-3xl p-4 md:p-12 flex flex-col md:flex-row items-center md:justify-center gap-4 md:gap-12 transition-all duration-300 w-full h-full max-w-4xl max-h-[96dvh] overflow-hidden"
         >
           {/* Header Stats - 8% height approx */}
           <div className="absolute top-4 md:top-6 left-4 md:left-12 right-4 md:right-12 flex justify-between items-center z-20 h-[8%]">
@@ -1246,7 +1438,7 @@ export default function App() {
           <div className="flex flex-col items-center text-center md:items-start md:text-left justify-center w-full md:w-80 min-h-0 md:overflow-hidden pb-8 md:pb-0 h-[60%]">
             
             {/* Static Metadata Block */}
-            <div className="h-[120px] w-full flex flex-col items-center justify-center bg-white/[0.03] border border-white/10 rounded-2xl mb-3 md:mb-4 flex-shrink-0 overflow-hidden relative group">
+            <div className="h-[120px] w-full flex flex-col items-center justify-center bg-black border border-white/10 rounded-2xl mb-3 md:mb-4 flex-shrink-0 overflow-hidden relative group">
                <div className="absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent pointer-events-none" />
                <AnimatePresence mode="wait">
                  <motion.div
@@ -1257,20 +1449,22 @@ export default function App() {
                    transition={{ duration: 0.4, ease: "easeOut" }}
                    className="text-center px-4 w-full"
                  >
-                   <h2 
-                     className="text-white text-xl md:text-2xl font-black tracking-tighter uppercase leading-tight mb-1 truncate"
-                     style={{ textShadow: `0 0 10px ${moodColor}, 0 0 20px ${moodColor}` }}
-                   >
-                     {micMode ? "MIC_ACTIVE" : (captureMode ? "EXTERNAL_INPUT" : track.title)}
-                   </h2>
+                   <div className="marquee-container mb-1">
+                     <h2 
+                       className="marquee-content font-dot text-white text-xl md:text-2xl font-black tracking-tighter uppercase leading-tight"
+                       style={{ textShadow: `0 0 10px ${hexToRgba(moodColor, 0.5)}` }}
+                     >
+                       {micMode ? "MIC_ACTIVE" : (captureMode ? "EXTERNAL_INPUT" : track.title)}
+                     </h2>
+                   </div>
                    <div className="flex items-center justify-center gap-2 mb-2">
                      <div className="h-[1px] w-4 bg-emerald-500/50" />
                      <div className="w-1 h-1 rounded-full bg-emerald-500" />
                      <div className="h-[1px] w-4 bg-emerald-500/50" />
                    </div>
                    <p 
-                     className="text-emerald-400 text-[10px] font-bold tracking-[0.3em] uppercase truncate"
-                     style={{ opacity: 0.6 + energyRef.current * 0.4 }}
+                     className="font-dot text-emerald-400 text-[10px] font-bold tracking-[0.3em] uppercase truncate"
+                     style={{ opacity: 0.6 + energyRef.current * 0.4, textShadow: `0 0 5px ${hexToRgba(moodColor, 0.3)}` }}
                    >
                      {audioError || (micMode ? "LIVE_INPUT" : (captureMode ? "SYSTEM_CAPTURE" : track.sub))}
                    </p>
@@ -1423,40 +1617,17 @@ export default function App() {
               </div>
             </motion.div>
 
-            {/* Track List */}
-            <div className="mb-3 md:mb-8 max-h-16 md:max-h-32 overflow-hidden pr-2 w-full flex-shrink min-h-0">
-              <div className="space-y-1">
-                {tracks.map((t, i) => (
-                  <motion.button
-                    key={i}
-                    whileHover={{ x: 4, backgroundColor: "rgba(255,255,255,0.03)" }}
-                    whileTap={{ scale: 0.98 }}
-                    onClick={() => { setTidx(i); setPlaying(true); }}
-                    className={`w-full text-left px-3 py-2 rounded flex items-center justify-between group transition-colors ${i === tidx ? 'bg-white/5' : 'hover:bg-white/[0.02]'}`}
-                  >
-                    <div className="flex items-center gap-3 overflow-hidden">
-                      <span className={`text-[8px] font-mono ${i === tidx ? 'text-emerald-400' : 'text-white/10'}`}>
-                        {String(i + 1).padStart(2, '0')}
-                      </span>
-                      <span className={`text-[10px] truncate tracking-wider ${i === tidx ? 'text-white' : 'text-white/40'}`}>
-                        {t.title}
-                      </span>
-                    </div>
-                    {i === tidx && playing && (
-                      <div className="flex gap-0.5 items-end h-2">
-                        {[0, 1, 2].map(b => (
-                          <motion.div
-                            key={b}
-                            animate={{ height: [2, 8, 4, 10, 2] }}
-                            transition={{ duration: 0.5 + b * 0.1, repeat: Infinity }}
-                            className="w-0.5 bg-emerald-400"
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </motion.button>
-                ))}
-              </div>
+            {/* Library Access */}
+            <div className="mb-3 md:mb-8 w-full flex-shrink-0">
+              <motion.button
+                whileHover={{ scale: 1.02, backgroundColor: "rgba(255,255,255,0.05)" }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => setShowLibrary(true)}
+                className="w-full py-3 border border-white/10 rounded-xl flex items-center justify-center gap-3 text-[10px] tracking-[0.2em] text-white/40 hover:text-white transition-all group"
+              >
+                <MusicIcon size={14} className="group-hover:text-emerald-400 transition-colors" />
+                <span>OPEN_LIBRARY [{tracks.length}]</span>
+              </motion.button>
             </div>
 
             {/* Footer Actions */}
@@ -1509,7 +1680,7 @@ export default function App() {
         {showEq && (
           <motion.div 
             initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 20 }}
-            className="fixed inset-x-4 md:inset-x-auto md:right-8 top-1/2 -translate-y-1/2 z-[3000] bg-[#080808]/90 border border-white/10 p-6 md:p-8 rounded-2xl backdrop-blur-xl shadow-2xl"
+            className="fixed inset-x-4 md:inset-x-auto md:right-8 top-1/2 -translate-y-1/2 z-[3000] bg-black border border-white/10 p-6 md:p-8 rounded-2xl shadow-2xl"
           >
             <div className="flex justify-between items-center mb-8">
               <div className="flex flex-col">
@@ -1564,10 +1735,10 @@ export default function App() {
         {showSess && (
           <motion.div 
             initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }}
-            className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/80 backdrop-blur-sm"
+            className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/90"
             onClick={() => setShowSess(false)}
           >
-            <div className="bg-[#080808] border border-white/10 p-8 rounded-2xl w-64" onClick={e => e.stopPropagation()}>
+            <div className="bg-black border border-white/10 p-8 rounded-2xl w-64" onClick={e => e.stopPropagation()}>
               <h3 className="text-[10px] tracking-[0.2em] text-white/30 mb-6 uppercase">Session Timer</h3>
               <div className="grid grid-cols-2 gap-2">
                 {[5, 10, 20, 30, 45, 60].map(min => (
@@ -1592,6 +1763,116 @@ export default function App() {
                   CANCEL TIMER
                 </motion.button>
               )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Library Overlay */}
+      <AnimatePresence>
+        {showLibrary && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 1.1 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 1.1 }}
+            className="fixed inset-0 z-[4000] bg-black p-6 md:p-12 flex flex-col"
+          >
+            <div className="flex justify-between items-center mb-8">
+              <div className="flex items-center gap-4">
+                <MusicIcon size={24} className="text-emerald-400" />
+                <div>
+                  <h2 className="text-xl font-black tracking-tighter uppercase">Music Registry</h2>
+                  <p className="text-[10px] text-white/30 tracking-widest uppercase">{tracks.length} Tracks Indexed</p>
+                </div>
+              </div>
+              <motion.button
+                whileHover={{ rotate: 90, scale: 1.1 }}
+                whileTap={{ scale: 0.9 }}
+                onClick={() => setShowLibrary(false)}
+                className="w-12 h-12 rounded-full border border-white/10 flex items-center justify-center text-white/40 hover:text-white hover:border-white/30 transition-all"
+              >
+                <X size={20} />
+              </motion.button>
+            </div>
+
+            <div className="relative mb-8">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-white/20" size={16} />
+              <input 
+                type="text"
+                placeholder="SEARCH_REGISTRY..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-white/[0.03] border border-white/10 rounded-xl py-4 pl-12 pr-4 text-sm tracking-widest focus:outline-none focus:border-emerald-500/50 transition-colors uppercase font-mono"
+              />
+            </div>
+
+            <div className="flex-1 overflow-y-auto custom-scrollbar pr-4 space-y-2">
+              {filteredTracks.map((t, i) => {
+                const originalIndex = tracks.indexOf(t);
+                const isActive = originalIndex === tidx;
+                return (
+                  <motion.div
+                    key={originalIndex}
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: i * 0.02 }}
+                    className={`group flex items-center justify-between p-4 rounded-xl border transition-all ${isActive ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-white/[0.02] border-white/5 hover:border-white/20'}`}
+                  >
+                    <div 
+                      className="flex-1 flex items-center gap-6 cursor-pointer"
+                      onClick={() => { setTidx(originalIndex); setPlaying(true); setShowLibrary(false); }}
+                    >
+                      <span className={`text-xs font-mono w-8 ${isActive ? 'text-emerald-400' : 'text-white/10'}`}>
+                        {String(originalIndex + 1).padStart(2, '0')}
+                      </span>
+                      <div className="flex flex-col">
+                        <span className={`text-sm font-bold tracking-wider ${isActive ? 'text-white' : 'text-white/60'}`}>{t.title}</span>
+                        <span className="text-[9px] text-white/20 tracking-widest uppercase">{t.sub}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      {isActive && playing && (
+                        <div className="flex gap-1 items-end h-3">
+                          {[0, 1, 2, 3].map(b => (
+                            <motion.div
+                              key={b}
+                              animate={{ height: [4, 12, 6, 16, 4] }}
+                              transition={{ duration: 0.5 + b * 0.1, repeat: Infinity }}
+                              className="w-1 bg-emerald-400"
+                            />
+                          ))}
+                        </div>
+                      )}
+                      <motion.button
+                        whileHover={{ scale: 1.2, color: "#f87171" }}
+                        whileTap={{ scale: 0.8 }}
+                        onClick={(e) => { e.stopPropagation(); deleteTrack(originalIndex); }}
+                        className="text-white/10 hover:text-red-400 transition-colors p-2"
+                      >
+                        <Trash2 size={16} />
+                      </motion.button>
+                    </div>
+                  </motion.div>
+                );
+              })}
+              {filteredTracks.length === 0 && (
+                <div className="h-64 flex flex-col items-center justify-center text-white/10 gap-4">
+                  <Search size={48} />
+                  <p className="text-xs tracking-[0.3em] uppercase">No Matches Found</p>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-8 pt-8 border-t border-white/5 flex justify-between items-center">
+              <p className="text-[10px] text-white/20 tracking-widest uppercase">Registry Sync: Active</p>
+              <motion.button
+                whileHover={{ scale: 1.05, backgroundColor: "rgba(255,255,255,0.05)" }}
+                whileTap={{ scale: 0.95 }}
+                onClick={onLoadFolderClick}
+                className="px-6 py-3 border border-white/10 rounded-lg text-[10px] tracking-widest uppercase hover:text-emerald-400 transition-colors"
+              >
+                Add New Files
+              </motion.button>
             </div>
           </motion.div>
         )}

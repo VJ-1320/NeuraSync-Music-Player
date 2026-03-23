@@ -1,4 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&display=swap');
 @import "tailwindcss";
+
+@theme {
+  --font-dot: "Silkscreen", "Press Start 2P", system-ui, sans-serif;
+}
 
 @layer base {
   html, body, #root {
@@ -7,6 +12,7 @@
     overflow: hidden;
     margin: 0;
     padding: 0;
+    background-color: #000000;
   }
 }
 
@@ -23,5 +29,37 @@
   }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
     background: rgba(255, 255, 255, 0.2);
+  }
+
+  .marquee-container {
+    overflow: hidden;
+    white-space: nowrap;
+    width: 100%;
+    position: relative;
+  }
+
+  .marquee-content {
+    display: inline-block;
+    padding-left: 100%;
+    animation: marquee 15s linear infinite;
+  }
+
+  @keyframes marquee {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-100%); }
+  }
+}
+
+/* Ambient Landscape Lock */
+.ambient-lock {
+  @media (orientation: portrait) {
+    width: 100vmax;
+    height: 100vmin;
+    transform: rotate(90deg);
+    transform-origin: center;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    translate: -50% -50%;
   }
 }

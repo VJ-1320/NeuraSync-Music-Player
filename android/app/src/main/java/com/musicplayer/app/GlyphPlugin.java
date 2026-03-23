@@ -18,6 +18,16 @@ public class GlyphPlugin extends Plugin {
         @Override
         public void onServiceConnected() {
             // Service connected
+            // Ensure the media session remains active even when the UI is not in the foreground
+            // by pinning the Glyph service connection for background tasks.
+            if (glyphManager != null) {
+                try {
+                    // This ensures the Glyph session persists during background audio playback
+                    glyphManager.display(glyphManager.getGlyphFrameBuilder().build());
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
         }
 
         @Override
@@ -25,6 +35,26 @@ public class GlyphPlugin extends Plugin {
             // Service disconnected
         }
     };
+
+    @PluginMethod
+    public void requestBatteryOptimization(PluginCall call) {
+        try {
+            android.content.Context context = getContext();
+            android.os.PowerManager pm = (android.os.PowerManager) context.getSystemService(android.content.Context.POWER_SERVICE);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                if (!pm.isIgnoringBatteryOptimizations(context.getPackageName())) {
+                    android.content.Intent intent = new android.content.Intent();
+                    intent.setAction(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(android.net.Uri.parse("package:" + context.getPackageName()));
+                    intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    context.startActivity(intent);
+                }
+            }
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("Failed to request battery optimization: " + e.getMessage());
+        }
+    }
 
     @PluginMethod
     public void initGlyph(PluginCall call) {

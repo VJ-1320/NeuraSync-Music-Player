@@ -1,5 +1,5 @@
 {
   "name": "NEURAL_SYNC Desktop",
   "description": "A high-performance, reactive music environment with live audio capture and biometric-inspired visualization.",
-  "requestFramePermissions": ["microphone", "display-capture"]
+  "requestFramePermissions": ["microphone", "display-capture", "wake-lock"]
 }
