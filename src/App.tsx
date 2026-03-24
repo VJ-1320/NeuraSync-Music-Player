@@ -11,6 +11,8 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { Capacitor, registerPlugin } from "@capacitor/core";
+import { App as CapacitorApp } from "@capacitor/app";
+import { MediaSession } from "capacitor-media-session";
 import { FilePicker } from "@capawesome/capacitor-file-picker";
 import { CapacitorUpdater } from "@capgo/capacitor-updater";
 
@@ -655,7 +657,7 @@ export default function App() {
         // Trigger Glyph Intensity Pulse (Throttled to 150ms)
         const now = performance.now();
         if (Capacitor.isNativePlatform() && now - lastPulseRef.current > 150) {
-          (GlyphPlugin as any).triggerIntensityPulse({ brightness: Math.round(avg) }).catch(() => {});
+          GlyphPlugin.triggerIntensityPulse({ brightness: Math.round(avg) }).catch(() => {});
           lastPulseRef.current = now;
         }
 
@@ -759,8 +761,8 @@ export default function App() {
           if ('wakeLock' in navigator) {
             wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
           }
-          // Request foreground service and wake lock via GlyphPlugin (assumed native bridge)
-          await (GlyphPlugin as any).startForegroundService({
+          // Request foreground service and wake lock via GlyphPlugin
+          await GlyphPlugin.startForegroundService({
             title: "NEURAL_SYNC ACTIVE",
             text: "OPTIMIZING_BACKGROUND_RELIABILITY..."
           });
@@ -775,7 +777,7 @@ export default function App() {
         wakeLockRef.current = null;
       }
       if (Capacitor.isNativePlatform()) {
-        (GlyphPlugin as any).stopForegroundService().catch(() => {});
+        GlyphPlugin.stopForegroundService().catch(() => {});
       }
     }
   }, [playing]);
@@ -786,6 +788,87 @@ export default function App() {
     }
     setPlaying(p => !p);
   }, []);
+
+  // ─── Native Integrations ──────────────────────────────────────────────────────
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) {
+      // 1. Media Session Action Handlers
+      const playListener = MediaSession.addListener('play', () => {
+        if (!playing) togglePlay();
+      });
+      const pauseListener = MediaSession.addListener('pause', () => {
+        if (playing) togglePlay();
+      });
+      const nextListener = MediaSession.addListener('nexttrack', () => changeTrack(1));
+      const prevListener = MediaSession.addListener('previoustrack', () => changeTrack(-1));
+
+      // 2. Overlay Permission Check & Request
+      const initOverlay = async () => {
+        try {
+          const { granted } = await GlyphPlugin.checkOverlayPermission();
+          if (!granted) {
+            await GlyphPlugin.requestOverlayPermission();
+          }
+        } catch (e) {
+          console.error("Overlay permission check failed:", e);
+        }
+      };
+      initOverlay();
+
+      // 3. App State Change (Dynamic Island Trigger)
+      let appStateListener: any;
+      const setupAppState = async () => {
+        appStateListener = await CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+          if (!isActive && playing) {
+            const track = tracks[tidx];
+            GlyphPlugin.showOverlay({
+              trackTitle: track?.title || "NEURAL_SYNC",
+              moodColor: moodColor
+            }).catch(e => console.error("Overlay error:", e));
+          } else {
+            GlyphPlugin.hideOverlay().catch(() => {});
+          }
+        });
+      };
+      setupAppState();
+
+      return () => {
+        playListener.remove();
+        pauseListener.remove();
+        nextListener.remove();
+        prevListener.remove();
+        if (appStateListener) appStateListener.remove();
+      };
+    }
+  }, [playing, tidx, tracks, moodColor, togglePlay, changeTrack]);
+
+  // 4. Media Session Metadata Sync
+  useEffect(() => {
+    if (Capacitor.isNativePlatform() && tracks.length > 0) {
+      const track = tracks[tidx];
+      if (track) {
+        MediaSession.setMetadata({
+          title: track.title,
+          artist: track.artist,
+          album: "NEURAL_SYNC",
+          artwork: [
+            {
+              src: "https://picsum.photos/seed/" + encodeURIComponent(track.title) + "/512/512",
+              sizes: "512x512",
+              type: "image/jpeg"
+            }
+          ]
+        }).catch(e => console.error("MediaSession Metadata error:", e));
+      }
+
+      // Note: setPlaybackState might not be in the type definition but is often available
+      if ((MediaSession as any).setPlaybackState) {
+        (MediaSession as any).setPlaybackState({
+          state: playing ? 'playing' : 'paused'
+        }).catch((e: any) => console.error("MediaSession State error:", e));
+      }
+    }
+  }, [tidx, playing, tracks]);
 
   const onTouchMove = useCallback((e: React.TouchEvent) => {
     if (dragging.current) {
